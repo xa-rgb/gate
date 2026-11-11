@@ -124,6 +124,33 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: 取回前几轮产物
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ needs.sync.outputs.run_id }}
+        run: |
+          set -u
+          # 从上一次往前数 2 个成功的 check 运行（本轮之外），用于三轮并集
+          ids=$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow=check.yml --limit 10 \
+                  --json databaseId,conclusion \
+                  --jq '[.[] | select(.conclusion == "success") | .databaseId] | .[]')
+          n=0
+          for rid in ${ids}; do
+            [ "${rid}" = "${RUN_ID}" ] && continue
+            n=$((n + 1))
+            [ "${n}" -gt 2 ] && break
+            if gh run download "${rid}" --repo "${GITHUB_REPOSITORY}" -n github-pages -D "_rounds/${n}" 2>/dev/null \
+               && [ -f "_rounds/${n}/artifact.tar" ]; then
+              mkdir -p "_rounds/${n}/public"
+              tar -xf "_rounds/${n}/artifact.tar" -C "_rounds/${n}/public"
+              echo "第 ${n} 轮（上一轮）取自运行 ${rid}"
+            else
+              rm -rf "_rounds/${n}"
+              echo "::warning::运行 ${rid} 的产物取不到，跳过该轮"
+            fi
+          done
+          ls -R _rounds 2>/dev/null | head -20 || echo "没有历史轮次（首次运行属正常）"
+
       - name: 取回本轮产物
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -138,7 +165,7 @@ jobs:
             echo "已从 artifact 取到本轮产物（run ${RUN_ID}）"
           else
             echo "::warning::本轮 artifact 取不到，退回使用站点上已发布的结果"
-            site="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+            site="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
             mkdir -p _art/public
             curl -sSL --retry 3 "${site}/data.json?t=$(date +%s)" -o _art/public/data.json
             curl -sSL --retry 3 "${site}/index.html?t=$(date +%s)" -o _art/public/index.html || true
@@ -150,6 +177,7 @@ jobs:
         env:
           CHECK_WORKER: "https://${{ secrets.DOMAIN }}/check?sstp=vpn:vpn@"
           ARTIFACT_DIR: _art
+          ROUNDS_DIR: _rounds
           OUT_DIR: _out
           SITE_URL: "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
           MERGE_ROUNDS: '3'
