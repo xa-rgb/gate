@@ -7,11 +7,15 @@
   3. Xiaobei09/proxyip 全池          data/valid/all.txt（1.7 万条，本地只留「-RES/-MOB 且带 -CN 标记」
                                     即上游实测大陆可达的住宅/移动出口；premium 只是它的前 10%，全池能多捞 1400 多条）
 
-判定口径（三套独立来源交叉，不轻信上游标签）：
-1. ip-api.com 的 hosting 标记 —— true 即机房/云主机
-2. AliDNS DoH 反查 PTR —— netvigator / ctinets / dynamic-ip 这类是家用宽带；
-   imsbiz / business / cloud / vps 这类是商用线或机房，要从「家宽」里踢掉
+判定口径（自己重判，不轻信上游标签）：
+1. 机房品牌词先拦：ip-api 的 hosting 标记对小主机商经常失灵（它们把自己注册成 ISP），
+   所以再用 Oracle / AWS / DigitalOcean / Leaseweb / VPS 商名等关键词硬拦一层
+2. 家宽只认正面证据：PTR 或 ISP/ASN 文本命中家用线路命名习惯（hinet/dynamic/pppoe/fixed…）
+   或家用运营商名（Chunghwa、KPN、Ziggo、Comcast、AT&T…）
 3. TCP 实测 —— 连不上的直接不发
+
+不做「没被标成机房就算家宽」的兜底：实测那样会把注册成 ISP 的 VPS 商全收进来，
+标 1098 条家宽里只有 201 条是真的，这个坑已经在 2026-11-11 踩过并修掉。
 
 产物（写进 OUT_DIR/proxyip/）：
   all.txt           全部有效节点，家宽优先
@@ -83,15 +87,41 @@ SOURCES = [
 LINE_RE = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})(?:#(.*))?$")
 UPTIME_RE = re.compile(r"-U(\d{1,3})")
 
-# PTR 里出现这些词 = 商用线/机房，不能算家宽
-BIZ_HINTS = (
-    "imsbiz", "business", "biz.", "corp", "datacenter", "data-center", "idc",
-    "cloud", "vps", "server", "hosting", "colo", "cdn", "dedicated",
+# 出现即判机房（优先级最高）。ip-api 的 hosting 标记对小主机商经常失灵，
+# 它们把自己注册成 ISP，所以必须再加一层「机房品牌词」硬拦。
+DC_HINTS = (
+    "oracle", "amazon", "aws", "google", "microsoft", "azure", "digitalocean", "linode",
+    "vultr", "ovh", "hetzner", "contabo", "cloudflare", "tencent", "alibaba", "aliyun",
+    "huawei", "ucloud", "leaseweb", "m247", "psychz", "colocrossing", "choopa", "hostinger",
+    "hosthatch", "kamatera", "ionos", "godaddy", "namecheap", "hosting", "host", "vps",
+    "cloud", "colo", "datacenter", "data center", "data-center", "dedicated", "server",
+    "backbone", "transit", "cdn", "ip-ptr", "hosted-by", "senko", "waicore", "delis",
+    "nktelecom", "global connectivity", "anarchy lab", "baykov", "golden hightech", "idc",
+    "solutions", "technologies", "webhorizon", "quicksrv", "fdcservers", "cgi global",
+    "capdecision", "ibcs", "veesp", "bytevirt", "sebek", "timeweb", "my-vm", "smartnet",
+    # 骨干网/批发转售，不是家用线路（Telia 本身是运营商，但 Telia Carrier 是骨干）
+    "cogent", "zayo", "hurricane electric", "telia carrier", "carrier", "lumen",
+    "ntt america", "pccw global", "global crossing", "level3", "level 3",
 )
-# 出现这些词基本可确认为家用宽带
+# 正面证据：家用宽带线路的命名习惯 + 各地区典型家用运营商。
+# 只认这些，不认「没被标成机房」——否则那些注册成 ISP 的 VPS 商会被误收。
 HOME_HINTS = (
-    "dynamic", "dhcp", "ppp", "broadband", "netvigator", "ctinets", "hsd1",
-    "cable", "fiber", "adsl", "vdsl", "residential", "home",
+    "dynamic", "dhcp", "pppoe", "ppp", "adsl", "vdsl", "ftth", "fiber", "fibre",
+    "broadband", "cable", "residential", "home", ".pool", "hinet", "hi-net", "fixed",
+    "chunghwa", "kbro", "seednet", "tbc", "netvigator", "hkbn", "hgc", "i-cable",
+    "korea telecom", "kt corp", "sk broadband", "lg u+", "sk telecom", "dlive", "sejong",
+    "kddi", "softbank", "biglobe", "plala", "ocn", "so-net", "j:com", "nuro", "commufa",
+    "comcast", "verizon", "at&t", "charter", "spectrum", "cox", "centurylink", "frontier",
+    "windstream", "mediacom", "suddenlink", "altice", "optimum", "fios",
+    "bell canada", "telus", "rogers", "shaw", "videotron", "cogeco",
+    "bt ", "virgin media", "sky broadband", "talktalk", "plusnet",
+    "deutsche telekom", "vodafone", "1&1", "unitymedia", "kabel", "netcologne", "m-net",
+    "orange", "free sas", "sfr", "bouygues", "kpn", "ziggo", "xs4all", "telfort",
+    "telefonica", "telecom italia", "fastweb", "proximus", "telenet", "telia", "elisa",
+    "telenor", "swisscom", "sunrise", "cosmote", "ote ", "upc", "liberty global",
+    "vectra", "inea", "multimedia polska", "netia", "orange polska", "t-mobile",
+    "telstra", "optus", "tpg", "iinet", "spark nz", "2degrees", "vocus",
+    "singtel", "starhub", "m1 limited", "myrepublic", "viewqwest",
 )
 
 COUNTRY_ZH = {
@@ -278,15 +308,24 @@ def verify(rows: list[dict]) -> list[dict]:
     return alive
 
 
-def classify(geo: dict, ptr: str) -> str:
-    """返回 '家宽' 或 '机房'。"""
+def classify(geo: dict, ptr: str) -> tuple[str, str]:
+    """返回 (类型, 证据)。类型只有 '家宽' / '机房'。
+
+    判家宽必须有「正面证据」：PTR 或 ISP/ASN 文本命中家用线路特征。
+    不做「没被判成机房就当家宽」的兜底——实测那会把注册成 ISP 的 VPS 商
+    （SIA VEESP / ByteVirt / SEBEK 之类）全收进来，标 1098 条家宽里只有 201 条是真的。
+    """
+    blob = " ".join(str(geo.get(k) or "") for k in ("isp", "org", "as")).lower() + " " + ptr
     if geo.get("hosting") is True:
-        return "机房"
-    if any(h in ptr for h in BIZ_HINTS):
-        return "机房"
-    if geo.get("hosting") is False:
-        return "家宽"
-    return "家宽" if any(h in ptr for h in HOME_HINTS) else "机房"
+        return "机房", "ip-api 标记机房"
+    hit_dc = next((t for t in DC_HINTS if t in blob), "")
+    if hit_dc:
+        return "机房", f"机房品牌词:{hit_dc}"
+    for token in HOME_HINTS:
+        if token in blob:
+            where = "PTR" if token in ptr else "ISP"
+            return "家宽", f"{where}:{token}"
+    return "机房", "无家宽证据"
 
 
 # ---------------------------------------------------------------------------
@@ -367,9 +406,12 @@ th{{color:var(--dim);font-weight:500}}td:nth-child(n+3){{text-align:right;font-v
 </table></div>
 
 <div class="card"><h2>判定口径</h2>
-<div class="note">家宽 = ip-api 机房标记为否 <em>且</em> 反查域名不属于 imsbiz/business/cloud/vps 等商用线；
-全部条目在发布前都做过 TCP 连通性实测，连不上的已剔除。机房 IP 更适合跑流量，
-家宽 IP 更适合过风控，按需取用。</div></div>
+<div class="note"><strong>家宽必须有正面证据</strong>：反向解析域名或 ISP/ASN 名称命中家用线路特征
+（hinet / dynamic / pppoe / fixed / broadband 这类命名，或 Chunghwa、KPN、Ziggo、Comcast、AT&amp;T、Vodafone 等家用运营商）；
+只要出现 Oracle / AWS / DigitalOcean / Leaseweb / 各类 VPS 商等机房品牌词，或 ip-api 标记为机房，一律归机房。
+<em>不做「没被标成机房就算家宽」的兜底</em>——实测那样做会把注册成 ISP 的小 VPS 商全收进来。
+全部条目发布前都做过 TCP 连通性实测，连不上的已剔除。上游标称 RES 的准确率为
+{meta["upstream_res_agreement"]}（我们只认能证实的那部分）。机房 IP 更适合跑流量，家宽 IP 更适合过风控，按需取用。</div></div>
 </div></body></html>
 """
 
@@ -399,6 +441,7 @@ def main() -> None:
         cc = (g.get("countryCode") or "").upper() or "??"
         if cc == "CN" and not INCLUDE_CN:
             continue
+        kind, evidence = classify(g, ptr.get(r["ip"], ""))
         nodes.append({
             "endpoint": r["endpoint"],
             "ip": r["ip"],
@@ -410,7 +453,8 @@ def main() -> None:
             "isp": g.get("isp") or "",
             "asn": g.get("as") or "",
             "ptr": ptr.get(r["ip"], ""),
-            "kind": classify(g, ptr.get(r["ip"], "")),
+            "kind": kind,
+            "evidence": evidence,
             "mob": r["mob_hint"] or bool(g.get("mobile")),
             "source": r["source"],
             "res_hint": r["res_hint"],
@@ -459,6 +503,10 @@ def main() -> None:
 
     hinted = [n for n in nodes if n["res_hint"]]
     agree = sum(1 for n in hinted if n["kind"] == "家宽")
+    ev_stat = collections.Counter(
+        (n["evidence"].split(":")[0] if n["kind"] == "家宽" else "机房")
+        for n in nodes
+    )
 
     meta = {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -469,6 +517,7 @@ def main() -> None:
         "mobile": len(mob),
         "sources": sorted(src_stat.values(), key=lambda s: -s["lines"]),
         "upstream_res_agreement": f"{agree}/{len(hinted)}" if hinted else "n/a",
+        "evidence": dict(ev_stat),
         "regions": region_links,
         "duration_s": round(time.time() - started, 1),
     }
