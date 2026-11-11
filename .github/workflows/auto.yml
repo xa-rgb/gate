@@ -1,0 +1,76 @@
+name: Auto Sync & Keepalive
+
+# 本仓库唯一的定时入口，做三件事：
+#   1) 同步上游 hezhanleiok/gate —— 对方代码更新后自动跟进（check.yml 保持上游原版，不在此改动）
+#   2) 保活 —— 每 20 天以内至少产生一次提交，避免 GitHub 因 60 天无活动停掉定时任务
+#   3) 触发 VPN Gate Node Check（真正的抓取/检测逻辑在 check.yml + vpngate.py）
+
+on:
+  schedule:
+    # 每 2 小时一次（UTC）。GitHub 定时任务最小间隔 5 分钟，实际常有几分钟到十几分钟延迟。
+    - cron: '23 */2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: auto-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 配置 git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: 同步上游代码
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/hezhanleiok/gate.git 2>/dev/null || true
+          git fetch --no-tags upstream main
+          if git merge --no-edit -X ours upstream/main >/dev/null 2>&1; then
+            echo "上游 HEAD: $(git rev-parse --short upstream/main)"
+            echo "合并完成，当前 HEAD: $(git rev-parse --short HEAD)"
+          else
+            echo "::warning::上游合并冲突，已放弃本次合并并保留本仓库版本"
+            git merge --abort || true
+          fi
+
+      - name: 保活检查
+        run: |
+          set -euo pipefail
+          now=$(date -u +%s)
+          last=$(cat .keepalive 2>/dev/null || echo 0)
+          case "$last" in ''|*[!0-9]*) last=0 ;; esac
+          age=$(( (now - last) / 86400 ))
+          echo "距上次保活提交 ${age} 天（阈值 20 天）"
+          if [ "$age" -ge 20 ]; then
+            echo "$now" > .keepalive
+            git add .keepalive
+            git commit -m "chore: keepalive $(date -u +%F)"
+            echo "已生成保活提交"
+          else
+            echo "尚不需要保活提交"
+          fi
+
+      - name: 推送
+        run: git push origin HEAD:main
+
+      - name: 触发节点检测
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run check.yml --repo "${{ github.repository }}" \
+            -f max_nodes=0 -f concurrency=32 -f timeout=25
+          echo "已触发 check.yml（全量）"
