@@ -29,6 +29,7 @@ from pathlib import Path
 
 import requests
 
+
 def _find_root() -> Path:
     """本脚本与 vpngate.py 同目录，或在其任意上级目录里。"""
     here = Path(__file__).resolve().parent
