@@ -4,6 +4,8 @@
 数据源（多源合并，去重后统一复核）：
   1. 776771.xyz（GFW Radar）        https://776771.xyz/all.txt
   2. Xiaobei09/proxyip 的 -RES- 池   data/valid/all_premium.txt（上游已筛"真实住宅"，但我们仍自己重判）
+  3. Xiaobei09/proxyip 全池          data/valid/all.txt（1.7 万条，本地只留「-RES/-MOB 且带 -CN 标记」
+                                    即上游实测大陆可达的住宅/移动出口；premium 只是它的前 10%，全池能多捞 1400 多条）
 
 判定口径（三套独立来源交叉，不轻信上游标签）：
 1. ip-api.com 的 hosting 标记 —— true 即机房/云主机
@@ -14,6 +16,7 @@
 产物（写进 OUT_DIR/proxyip/）：
   all.txt           全部有效节点，家宽优先
   residential.txt   只要真家宽
+  mobile.txt        移动网络出口（-MOB 或 ip-api 判为 mobile），≥5 条才出
   <cc>.txt          按国家/地区拆（hk/tw/jp/kr/sg/us/de/nl…），家宽优先
   index.json        统计、来源明细与链接清单
   index.html        上面这些的网页版
@@ -26,6 +29,7 @@
   VERIFY_CONC    TCP 并发（默认 60）
   PTR_CONC       PTR 并发（默认 30）
   INCLUDE_CN     '1' 才保留中国大陆的 IP（默认剔除，因为我们只要海外出口）
+  MAX_CANDIDATES 候选上限（默认 6000），超了按「住宅优先 + uptime 高」截断，防止 CI 超时
 """
 from __future__ import annotations
 
@@ -48,13 +52,36 @@ SRC_OVERRIDE = os.environ.get("PROXYIP_SRC", "").strip()
 VERIFY_CONC = int(os.environ.get("VERIFY_CONC", "60"))
 PTR_CONC = int(os.environ.get("PTR_CONC", "30"))
 INCLUDE_CN = os.environ.get("INCLUDE_CN", "") == "1"
+MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "6000"))
 
 RAW = "https://raw.githubusercontent.com/Xiaobei09/proxyip/main/data/valid"
+
+
+def cn_reachable(tag: str) -> bool:
+    """上游用 V4/V6 之后的 CN / CNH 段标记「大陆实测可达」，必须只在这段里找，
+    否则会把 `🇭🇰HK←CN-电信` 这种「出口地是 CN」误判成可达标记。"""
+    m = re.search(r"-V[46]-(.*)$", tag)
+    if not m:
+        return False
+    segs = m.group(1).split("-")
+    return "CN" in segs or "CNH" in segs
+
+
+def keep_cn_res(remark: str) -> bool:
+    """全池只收：上游标 residential / mobile，且带大陆可达标记。"""
+    up = remark.upper()
+    if "-RES" not in up and "-MOB" not in up:
+        return False
+    return cn_reachable(up)
+
+
 SOURCES = [
-    ("gfw-radar", "https://776771.xyz/all.txt"),
-    ("xiaobei-res", f"{RAW}/all_premium.txt"),
+    ("gfw-radar", "https://776771.xyz/all.txt", None),
+    ("xiaobei-res", f"{RAW}/all_premium.txt", None),
+    ("xiaobei-full", f"{RAW}/all.txt", keep_cn_res),
 ]
 LINE_RE = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})(?:#(.*))?$")
+UPTIME_RE = re.compile(r"-U(\d{1,3})")
 
 # PTR 里出现这些词 = 商用线/机房，不能算家宽
 BIZ_HINTS = (
@@ -90,8 +117,9 @@ def log(section: str, msg: str) -> None:
 # ---------------------------------------------------------------------------
 # 抓取与解析
 # ---------------------------------------------------------------------------
-def parse_list(text: str, source: str) -> list[dict]:
+def parse_list(text: str, source: str, keep=None) -> list[dict]:
     out = []
+    skipped = 0
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -100,30 +128,40 @@ def parse_list(text: str, source: str) -> list[dict]:
         if not m:
             continue
         remark = (m.group(3) or "").strip()
+        if keep is not None and not keep(remark):
+            skipped += 1
+            continue
+        up = remark.upper()
+        mu = UPTIME_RE.search(up)
         out.append({
             "endpoint": f"{m.group(1)}:{m.group(2)}",
             "ip": m.group(1),
             "port": int(m.group(2)),
             "remark": remark,
             "source": source,
-            "res_hint": "-RES" in remark.upper(),
+            "res_hint": "-RES" in up,
+            "mob_hint": "-MOB" in up,
+            "uptime": int(mu.group(1)) if mu else -1,
         })
+    if keep is not None:
+        log("源", f"{source:12} 按「住宅/移动 + 大陆可达」过滤，丢弃 {skipped} 条")
     return out
 
 
-def read_one(url: str, source: str) -> list[dict]:
+def read_one(url: str, source: str, keep=None) -> list[dict]:
     for attempt in (1, 2):
         try:
             if not url.startswith("http"):
                 text = Path(url.replace("file://", "")).read_text(encoding="utf-8")
             else:
-                resp = requests.get(url, timeout=40, headers={"user-agent": "gate-aggregator"})
+                resp = requests.get(url, timeout=60, headers={"user-agent": "gate-aggregator"})
                 resp.raise_for_status()
                 text = resp.text
-            rows = parse_list(text, source)
+            rows = parse_list(text, source, keep)
             if rows:
                 res = sum(1 for r in rows if r["res_hint"])
-                log("源", f"{source:12} {url.split('/')[-1]:20} → {len(rows):4} 条（标 RES {res}）")
+                mob = sum(1 for r in rows if r["mob_hint"])
+                log("源", f"{source:12} {url.split('/')[-1]:20} → {len(rows):4} 条（RES {res} / MOB {mob}）")
                 return rows
             log("源", f"{source} 解析出 0 条")
             return []
@@ -134,11 +172,11 @@ def read_one(url: str, source: str) -> list[dict]:
 
 
 def fetch_sources() -> list[dict]:
-    targets = ([(f"local-{i + 1}", p.strip()) for i, p in enumerate(SRC_OVERRIDE.split(",")) if p.strip()]
+    targets = ([(f"local-{i + 1}", p.strip(), None) for i, p in enumerate(SRC_OVERRIDE.split(",")) if p.strip()]
                if SRC_OVERRIDE else SOURCES)
     rows: list[dict] = []
-    for name, url in targets:
-        rows.extend(read_one(url, name))
+    for name, url, keep in targets:
+        rows.extend(read_one(url, name, keep))
 
     # 全部上游都失败时，退回本站上一版
     if not rows:
@@ -152,10 +190,19 @@ def fetch_sources() -> list[dict]:
             merged[r["endpoint"]] = r
         else:
             prev["res_hint"] = prev["res_hint"] or r["res_hint"]
+            prev["mob_hint"] = prev["mob_hint"] or r["mob_hint"]
+            prev["uptime"] = max(prev["uptime"], r["uptime"])
             if r["source"] not in prev["source"]:
                 prev["source"] = f"{prev['source']}+{r['source']}"
     log("合并", f"原始 {len(rows)} 条 → 去重 {len(merged)} 条")
-    return list(merged.values())
+
+    final = list(merged.values())
+    if len(final) > MAX_CANDIDATES:
+        # 上游暴涨时的兜底：住宅优先、uptime 高的先测，保证 CI 时长可控
+        final.sort(key=lambda r: (not r["res_hint"], -r["uptime"]))
+        log("合并", f"候选 {len(final)} 条超上限 {MAX_CANDIDATES}，按住宅/uptime 截断")
+        final = final[:MAX_CANDIDATES]
+    return final
 
 
 # ---------------------------------------------------------------------------
@@ -164,20 +211,28 @@ def fetch_sources() -> list[dict]:
 def enrich_geo(rows: list[dict]) -> dict[str, dict]:
     fields = "status,country,countryCode,city,isp,org,as,hosting,mobile"
     geo: dict[str, dict] = {}
-    ips = [r["ip"] for r in rows]
+    ips = list({r["ip"] for r in rows})
+    total = (len(ips) + 99) // 100
     for i in range(0, len(ips), 100):
         chunk = ips[i:i + 100]
-        try:
-            resp = requests.post("http://ip-api.com/batch", params={"fields": fields},
-                                 json=chunk, timeout=45)
-            data = resp.json()
-            for ip, item in zip(chunk, data):
-                geo[ip] = item if isinstance(item, dict) else {}
-            log("归属", f"批次 {i // 100 + 1}: {len(data)} 条")
-        except Exception as exc:  # noqa: BLE001
-            log("归属", f"批次 {i // 100 + 1} 失败（{type(exc).__name__}），该批按未知处理")
+        for attempt in (1, 2, 3):
+            try:
+                resp = requests.post("http://ip-api.com/batch", params={"fields": fields},
+                                     json=chunk, timeout=45)
+                data = resp.json()
+                if not isinstance(data, list):  # 额度用尽时返回的是 {"message": ...}
+                    raise RuntimeError(str(data)[:80])
+                for ip, item in zip(chunk, data):
+                    geo[ip] = item if isinstance(item, dict) else {}
+                log("归属", f"批次 {i // 100 + 1}/{total}: {len(data)} 条")
+                break
+            except Exception as exc:  # noqa: BLE001
+                if attempt == 3:
+                    log("归属", f"批次 {i // 100 + 1} 三次失败（{type(exc).__name__}），该批按未知处理")
+                else:
+                    time.sleep(15)  # 免费额度 15 批/分钟，撞限流就歇一轮
         if i + 100 < len(ips):
-            time.sleep(4)  # 免费额度 15 批/分钟
+            time.sleep(4.5)
     return geo
 
 
@@ -291,12 +346,13 @@ th{{color:var(--dim);font-weight:500}}td:nth-child(n+3){{text-align:right;font-v
 </style></head><body><div class="wrap">
 <h1>ProxyIP 聚合（含真家宽分地区）</h1>
 <div class="sub">更新于 {meta["generated_at"]} ｜ 去重候选 {meta["candidates"]} 条 →
-存活 {meta["alive"]} 条（家宽 {meta["residential"]} / 机房 {meta["datacenter"]}）</div>
+存活 {meta["alive"]} 条（家宽 {meta["residential"]} / 机房 {meta["datacenter"]} / 移动 {meta["mobile"]}）</div>
 
 <div class="card"><h2>订阅链接</h2><ul>
 <li><a href="/nodes.txt">/nodes.txt</a> — 原 SSTP 节点（不变）</li>
 <li><a href="/mix.txt">/mix.txt</a> — <strong>合并版</strong>：SSTP 节点 + 真家宽 ProxyIP</li>
 <li><a href="/proxyip/residential.txt">/proxyip/residential.txt</a> — 只真家宽</li>
+<li><a href="/proxyip/mobile.txt">/proxyip/mobile.txt</a> — 移动网络出口（家宽/蜂窝）</li>
 <li><a href="/proxyip/all.txt">/proxyip/all.txt</a> — 全部（家宽优先，含机房）</li>
 </ul></div>
 
@@ -355,6 +411,7 @@ def main() -> None:
             "asn": g.get("as") or "",
             "ptr": ptr.get(r["ip"], ""),
             "kind": classify(g, ptr.get(r["ip"], "")),
+            "mob": r["mob_hint"] or bool(g.get("mobile")),
             "source": r["source"],
             "res_hint": r["res_hint"],
         })
@@ -369,9 +426,13 @@ def main() -> None:
                               n["port"] != 443, n["ip"]))
 
     res = [n for n in nodes if n["kind"] == "家宽"]
+    mob = [n for n in nodes if n["mob"]]
     base = OUT / "proxyip"
     write(base / "all.txt", fmt_lines(nodes))
     write(base / "residential.txt", fmt_lines(res))
+    if len(mob) >= 5:
+        write(base / "mobile.txt", fmt_lines(mob))
+        log("产物", f"mobile.txt = 移动网络出口 {len(mob)} 条")
 
     region_links = {}
     for cc in sorted(by_cc, key=lambda c: -by_cc[c]):
@@ -405,6 +466,7 @@ def main() -> None:
         "alive": len(nodes),
         "residential": len(res),
         "datacenter": len(nodes) - len(res),
+        "mobile": len(mob),
         "sources": sorted(src_stat.values(), key=lambda s: -s["lines"]),
         "upstream_res_agreement": f"{agree}/{len(hinted)}" if hinted else "n/a",
         "regions": region_links,
