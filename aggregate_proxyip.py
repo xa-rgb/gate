@@ -20,7 +20,7 @@
 产物（写进 OUT_DIR/proxyip/）：
   all.txt           全部有效节点，家宽优先
   residential.txt   只要真家宽
-  mobile.txt        移动网络出口（-MOB 或 ip-api 判为 mobile），≥5 条才出
+  mobile.txt        移动网络里的真家宽（上游 -MOB 且通过家宽判定），为 0 就不出
   <cc>.txt          按国家/地区拆（hk/tw/jp/kr/sg/us/de/nl…），家宽优先
   index.json        统计、来源明细与链接清单
   index.html        上面这些的网页版
@@ -470,13 +470,14 @@ def main() -> None:
                               n["port"] != 443, n["ip"]))
 
     res = [n for n in nodes if n["kind"] == "家宽"]
-    mob = [n for n in nodes if n["mob"]]
+    # 上游 -MOB 标签同样不可靠（会把荷兰的 VPS 也标成移动），必须和「已确认家宽」取交集
+    mob = [n for n in nodes if n["mob"] and n["kind"] == "家宽"]
     base = OUT / "proxyip"
     write(base / "all.txt", fmt_lines(nodes))
     write(base / "residential.txt", fmt_lines(res))
-    if len(mob) >= 5:
+    if mob:
         write(base / "mobile.txt", fmt_lines(mob))
-        log("产物", f"mobile.txt = 移动网络出口 {len(mob)} 条")
+        log("产物", f"mobile.txt = 移动网络里的真家宽 {len(mob)} 条")
 
     region_links = {}
     for cc in sorted(by_cc, key=lambda c: -by_cc[c]):
