@@ -45,6 +45,7 @@ import vpngate  # noqa: E402  上游模块，产物格式以它为准
 
 WORKER = os.environ.get("CHECK_WORKER", "").strip()
 ART = Path(os.environ.get("ARTIFACT_DIR", "_art"))
+ROUNDS_DIR = Path(os.environ.get("ROUNDS_DIR", "_rounds"))
 OUT = Path(os.environ.get("OUT_DIR", "_merged"))
 SITE = os.environ.get("SITE_URL", "https://xa-rgb.github.io/gate").rstrip("/")
 ROUNDS = max(2, int(os.environ.get("MERGE_ROUNDS", "3")))
@@ -81,6 +82,19 @@ def nodes_by_endpoint(data: dict | None) -> dict[str, dict]:
 
 
 def fetch_round(index: int) -> dict | None:
+    """取第 index 轮（1 = 上一个成功轮）。
+
+    优先读工作流提前下载好的 artifact（确定性最高，不受 Pages CDN 传播延迟影响），
+    取不到才退回已发布站点上的 history 快照。
+    """
+    art = ROUNDS_DIR / str(index)
+    if art.exists():
+        path = next(art.rglob("data.json"), None)
+        if path:
+            data = load_json(path)
+            if data:
+                log("历史", f"round-{index} 取自 artifact（{sum(len(g.get('nodes') or []) for g in data.get('countries', {}).values())} 个节点）")
+                return data
     # 加时间戳绕过 Pages 的 CDN 缓存，否则可能拿到上一轮的内容
     url = f"{SITE}/history/round-{index}.json?t={int(time.time())}"
     try:
