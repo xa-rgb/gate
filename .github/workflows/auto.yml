@@ -182,6 +182,8 @@ jobs:
           SITE_URL: "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
           MERGE_ROUNDS: '3'
           VERIFY_CONC: '32'
+          MAX_RESIDENTIAL_PER_COUNTRY: '60'
+          MAX_DATACENTER_PER_COUNTRY: '20'
         run: python merge_rounds.py
 
       - name: Setup Pages
