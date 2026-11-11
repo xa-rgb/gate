@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """把最近 N 轮的检测结果合并成一份，并逐个回测剔除已失效的节点。
 
-数据来源：
-- 本轮：check.yml 的 Pages 产物（data.json）
-- 历史：已发布站点的 history/round-1.json、history/round-2.json
+数据来源（按可靠性排序）：
+- 本轮：check.yml 的 Pages 产物（data.json，由工作流下载 artifact 得到）
+- 前几轮：更早的 check 运行 artifact（_rounds/1、_rounds/2）
+- 兜底：已发布站点的 history/round-*.json（artifact 过期或缺失时）
 
 产物沿用上游 vpngate.py 的 build_outputs / build_nodes_text / write_outputs，
 所以 data.json 的 schema、nodes.txt 的行格式与上游完全一致，前端不用改。
@@ -11,10 +12,12 @@
 环境变量：
   CHECK_WORKER   必填，形如 https://check.xxx/check?sstp=vpn:vpn@
   ARTIFACT_DIR   本轮产物目录（默认 _art）
+  ROUNDS_DIR     前几轮产物目录（默认 _rounds，其下 1、2 子目录）
   OUT_DIR        输出目录（默认 _merged）
   SITE_URL       已发布站点根（默认 https://xa-rgb.github.io/gate）
   MERGE_ROUNDS   合并几轮（默认 3）
   VERIFY_CONC    回测并发（默认 24）
+  MAX_RESIDENTIAL_PER_COUNTRY / MAX_DATACENTER_PER_COUNTRY  每国上限，0 = 不限（默认 0）
 """
 from __future__ import annotations
 
@@ -50,8 +53,10 @@ OUT = Path(os.environ.get("OUT_DIR", "_merged"))
 SITE = os.environ.get("SITE_URL", "https://xa-rgb.github.io/gate").rstrip("/")
 ROUNDS = max(2, int(os.environ.get("MERGE_ROUNDS", "3")))
 CONC = int(os.environ.get("VERIFY_CONC", "24"))
-MAX_RES = int(os.environ.get("MAX_RESIDENTIAL_PER_COUNTRY", "40"))
-MAX_DC = int(os.environ.get("MAX_DATACENTER_PER_COUNTRY", "15"))
+# 每国上限：默认 0 = 不限，三轮抓到多少就发多少（build_nodes_text 用切片实现，给个超大值即不截断）
+UNLIMITED = 10**6
+MAX_RES = int(os.environ.get("MAX_RESIDENTIAL_PER_COUNTRY", "0"))
+MAX_DC = int(os.environ.get("MAX_DATACENTER_PER_COUNTRY", "0"))
 
 
 def log(section: str, msg: str) -> None:
@@ -198,8 +203,8 @@ def main() -> None:
     cfg = dataclasses.replace(
         vpngate.Config.load(),
         public_dir=str(OUT),
-        max_residential_per_country=MAX_RES,
-        max_datacenter_per_country=MAX_DC,
+        max_residential_per_country=MAX_RES if MAX_RES > 0 else UNLIMITED,
+        max_datacenter_per_country=MAX_DC if MAX_DC > 0 else UNLIMITED,
     )
     data = vpngate.build_outputs(
         results=results,
