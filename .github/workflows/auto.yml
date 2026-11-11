@@ -185,6 +185,14 @@ jobs:
           # 每国上限留空 = 不限：三轮抓到多少、验活多少就发多少，不按国家配额截断
         run: python merge_rounds.py
 
+      - name: 聚合 ProxyIP（判真家宽 + 分地区）
+        continue-on-error: true
+        env:
+          OUT_DIR: _out
+          SITE_URL: "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+          VERIFY_CONC: '60'
+        run: python aggregate_proxyip.py
+
       - name: Setup Pages
         uses: actions/configure-pages@v5
 
