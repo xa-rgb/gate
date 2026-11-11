@@ -7,8 +7,9 @@ name: Auto Sync & Keepalive
 
 on:
   schedule:
-    # 每 30 分钟一次（UTC）。偏移到 :07 / :37，避开 GitHub 整点调度高峰。GitHub 定时任务最小间隔 5 分钟，实际常有几分钟到十几分钟延迟。
-    - cron: '7,37 * * * *'
+    # 每小时一次（UTC，偏移到 :17 避开整点高峰）。实测：单节点判定稳定 96%，而源站候选名单约 20 分钟就轮换一遍，
+  # 所以加密到 30 分钟并不提高可用性，只是换一批样本；1 小时是性价比拐点。
+    - cron: '17 * * * *'
   workflow_dispatch:
 
 permissions:
