@@ -1,14 +1,15 @@
 name: Auto Sync & Keepalive
 
-# 本仓库唯一的定时入口，做三件事：
+# 本仓库唯一的定时入口，做四件事：
 #   1) 同步上游 hezhanleiok/gate —— 对方代码更新后自动跟进（check.yml 保持上游原版，不在此改动）
 #   2) 保活 —— 每 20 天以内至少产生一次提交，避免 GitHub 因 60 天无活动停掉定时任务
 #   3) 触发 VPN Gate Node Check（真正的抓取/检测逻辑在 check.yml + vpngate.py）
+#   4) 三轮并集 —— 等 check 跑完，把它本轮结果与已发布的最近两轮合并，逐个回测剔除失效，再二次发布
 
 on:
   schedule:
     # 每小时一次（UTC，偏移到 :17 避开整点高峰）。实测：单节点判定稳定 96%，而源站候选名单约 20 分钟就轮换一遍，
-  # 所以加密到 30 分钟并不提高可用性，只是换一批样本；1 小时是性价比拐点。
+    # 所以加密到 30 分钟并不提高可用性，只是换一批样本；1 小时是性价比拐点。
     - cron: '17 * * * *'
   workflow_dispatch:
 
@@ -23,7 +24,9 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    outputs:
+      run_id: ${{ steps.dispatch.outputs.run_id }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -68,10 +71,97 @@ jobs:
       - name: 推送
         run: git push origin HEAD:main
 
-      - name: 触发节点检测
+      - name: 触发节点检测并等待完成
+        id: dispatch
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh workflow run check.yml --repo "${{ github.repository }}" \
+          set -uo pipefail
+          start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          gh workflow run check.yml --repo "${GITHUB_REPOSITORY}" \
             -f max_nodes=0 -f concurrency=32 -f timeout=25
-          echo "已触发 check.yml（全量）"
+          echo "已触发 check.yml（全量），等待它出现在运行列表里…"
+
+          run_id=""
+          for _ in $(seq 1 25); do
+            sleep 6
+            run_id=$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow=check.yml --limit 8 \
+              --json databaseId,createdAt \
+              --jq "[.[] | select(.createdAt >= \"${start}\")][0].databaseId // empty")
+            if [ -n "${run_id}" ]; then break; fi
+          done
+
+          if [ -z "${run_id}" ]; then
+            echo "::error::没等到本次 check.yml 的运行记录"
+            exit 1
+          fi
+          echo "本次运行 ID：${run_id}"
+          echo "run_id=${run_id}" >> "${GITHUB_OUTPUT}"
+
+          # 检测失败也继续往下走：合并层会退化成「重跑最近几轮」，仍能筛出存活节点
+          gh run watch "${run_id}" --repo "${GITHUB_REPOSITORY}" --exit-status --interval 20 \
+            || echo "::warning::check.yml 未成功结束，合并层将退回使用已发布结果"
+
+  merge:
+    needs: sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: 取回本轮产物
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ needs.sync.outputs.run_id }}
+        run: |
+          set -u
+          mkdir -p _art
+          if [ -n "${RUN_ID}" ] && gh run download "${RUN_ID}" --repo "${GITHUB_REPOSITORY}" \
+               -n github-pages -D _pages 2>/dev/null && [ -f _pages/artifact.tar ]; then
+            mkdir -p _art/public
+            tar -xf _pages/artifact.tar -C _art/public
+            echo "已从 artifact 取到本轮产物（run ${RUN_ID}）"
+          else
+            echo "::warning::本轮 artifact 取不到，退回使用站点上已发布的结果"
+            site="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+            mkdir -p _art/public
+            curl -sSL --retry 3 "${site}/data.json?t=$(date +%s)" -o _art/public/data.json
+            curl -sSL --retry 3 "${site}/index.html?t=$(date +%s)" -o _art/public/index.html || true
+          fi
+          test -s _art/public/data.json || { echo "::error::拿不到 data.json，无法合并"; exit 1; }
+          ls -la _art/public
+
+      - name: 三轮并集 + 回测剔除
+        env:
+          CHECK_WORKER: "https://${{ secrets.DOMAIN }}/check?sstp=vpn:vpn@"
+          ARTIFACT_DIR: _art
+          OUT_DIR: _out
+          SITE_URL: "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+          MERGE_ROUNDS: '3'
+          VERIFY_CONC: '32'
+        run: python merge_rounds.py
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _out
+
+      - name: 发布并集结果
+        id: deployment
+        uses: actions/deploy-pages@v4
