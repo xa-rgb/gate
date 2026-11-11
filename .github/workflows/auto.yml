@@ -7,8 +7,8 @@ name: Auto Sync & Keepalive
 
 on:
   schedule:
-    # 每 2 小时一次（UTC）。GitHub 定时任务最小间隔 5 分钟，实际常有几分钟到十几分钟延迟。
-    - cron: '23 */2 * * *'
+    # 每 30 分钟一次（UTC）。偏移到 :07 / :37，避开 GitHub 整点调度高峰。GitHub 定时任务最小间隔 5 分钟，实际常有几分钟到十几分钟延迟。
+    - cron: '7,37 * * * *'
   workflow_dispatch:
 
 permissions:
