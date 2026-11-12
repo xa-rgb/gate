@@ -185,13 +185,27 @@ jobs:
           # 每国上限留空 = 不限：三轮抓到多少、验活多少就发多少，不按国家配额截断
         run: python merge_rounds.py
 
-      - name: 聚合 ProxyIP（判真家宽 + 分地区）
+      - name: 聚合 ProxyIP（判真家宽 + 分地区 + 镜像源）
         continue-on-error: true
         env:
           OUT_DIR: _out
           SITE_URL: "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
           VERIFY_CONC: '60'
+          # 把拉到的原始源镜像到站点 /src/：国内直连自己的域名就能取源，
+          # 不用碰被 SNI 阻断的 raw.githubusercontent.com
+          MIRROR_DIR: _out/src
         run: python aggregate_proxyip.py
+
+      - name: 并入本机实测结果（local/）
+        run: |
+          set -u
+          if [ -d local ] && [ -n "$(ls -A local 2>/dev/null)" ]; then
+            mkdir -p _out/local
+            cp -rf local/. _out/local/
+            echo "已并入 local/：$(find _out/local -type f | wc -l) 个文件"
+          else
+            echo "local/ 为空或不存在，跳过（本机还没跑过 本地拉家宽.py --push）"
+          fi
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
