@@ -6,6 +6,8 @@
   2. Xiaobei09/proxyip 的 -RES- 池   data/valid/all_premium.txt（上游已筛"真实住宅"，但我们仍自己重判）
   3. Xiaobei09/proxyip 全池          data/valid/all.txt（1.7 万条，本地只留「-RES/-MOB 且带 -CN 标记」
                                     即上游实测大陆可达的住宅/移动出口；premium 只是它的前 10%，全池能多捞 1400 多条）
+  4. MarinaAqua/ProxyIP              ProxyList.txt（2.7 万行 CSV：ip,port,CC,ISP，用 ISP 列首筛家宽）
+  5. InconigtoVPN/ProxyIP            proxyList.txt（1.8 万行，同格式）
 
 判定口径（自己重判，不轻信上游标签）：
 1. 机房品牌词先拦：ip-api 的 hosting 标记对小主机商经常失灵（它们把自己注册成 ISP），
@@ -57,6 +59,7 @@ VERIFY_CONC = int(os.environ.get("VERIFY_CONC", "60"))
 PTR_CONC = int(os.environ.get("PTR_CONC", "30"))
 INCLUDE_CN = os.environ.get("INCLUDE_CN", "") == "1"
 MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "6000"))
+MIRROR_DIR = os.environ.get("MIRROR_DIR", "").strip()
 
 RAW = "https://raw.githubusercontent.com/Xiaobei09/proxyip/main/data/valid"
 
@@ -79,13 +82,29 @@ def keep_cn_res(remark: str) -> bool:
     return cn_reachable(up)
 
 
+def keep_csv_res(isp: str) -> bool:
+    """CSV 源带 ISP 列，先用名字粗筛（省掉 ip-api 额度），过筛的才进后续核验。
+    ISP 列本身有错标（实测把 Azure 段标成 1&1），所以后面还要 ip-api + PTR 复核。"""
+    return classify({"isp": isp, "hosting": False}, "")[0] == "家宽"
+
+
 SOURCES = [
-    ("gfw-radar", "https://776771.xyz/all.txt", None),
-    ("xiaobei-res", f"{RAW}/all_premium.txt", None),
-    ("xiaobei-full", f"{RAW}/all.txt", keep_cn_res),
+    {"name": "gfw-radar", "url": "https://776771.xyz/all.txt", "fmt": "list"},
+    {"name": "xiaobei-res", "url": f"{RAW}/all_premium.txt", "fmt": "list"},
+    {"name": "xiaobei-full", "url": f"{RAW}/all.txt", "fmt": "list", "keep": keep_cn_res},
+    # 两个 CSV 源（ip,port,CC,ISP）合计 4.5 万行；首筛靠 ISP 列，能捞出 370+ 条 ISP 名像家宽的
+    {"name": "marina-aqua",
+     "url": "https://raw.githubusercontent.com/MarinaAqua/ProxyIP/refs/heads/main/ProxyList.txt",
+     "fmt": "csv", "keep": keep_csv_res},
+    {"name": "inconigto",
+     "url": "https://raw.githubusercontent.com/InconigtoVPN/ProxyIP/refs/heads/main/proxyList.txt",
+     "fmt": "csv", "keep": keep_csv_res},
 ]
 LINE_RE = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})(?:#(.*))?$")
+CSV_RE = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3})\s*,\s*(\d{1,5})\s*,\s*([A-Za-z]{0,2})\s*,\s*(.*)$")
 UPTIME_RE = re.compile(r"-U(\d{1,3})")
+# 之前只看是不是 443，CSV 源带上来一堆高位端口，8443 得同等待遇
+PREFERRED_PORTS = (443, 8443)
 
 # 出现即判机房（优先级最高）。ip-api 的 hosting 标记对小主机商经常失灵，
 # 它们把自己注册成 ISP，所以必须再加一层「机房品牌词」硬拦。
@@ -144,6 +163,26 @@ def log(section: str, msg: str) -> None:
     print(f"[{section}] {msg}", flush=True)
 
 
+_MIRRORED: dict[str, dict] = {}
+
+
+def mirror(text: str, source: str, url: str) -> None:
+    """把拉到的原文存一份到站点 /src/，好让本地工具直接取。
+    因为 raw.githubusercontent.com 在国内是 SNI 阻断的，本地拿不到源；而自己的域名能直连。"""
+    _MIRRORED[source] = {"file": f"{source}.txt", "url": url, "bytes": len(text)}
+    if not MIRROR_DIR:
+        return
+    try:
+        p = Path(MIRROR_DIR) / f"{source}.txt"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        head = (f"# source: {url}\n"
+                f"# fetched: {datetime.now(timezone.utc):%Y-%m-%dT%H:%M:%SZ}  bytes: {len(text)}\n")
+        p.write_text(head + text, encoding="utf-8", newline="\n")
+        log("镜像", f"{source:14s} -> {p.name}（{len(text) // 1024} KB）")
+    except Exception as exc:  # noqa: BLE001
+        log("镜像", f"{source} 写失败（{type(exc).__name__}）")
+
+
 # ---------------------------------------------------------------------------
 # 抓取与解析
 # ---------------------------------------------------------------------------
@@ -178,7 +217,34 @@ def parse_list(text: str, source: str, keep=None) -> list[dict]:
     return out
 
 
-def read_one(url: str, source: str, keep=None) -> list[dict]:
+def parse_csv_list(text: str, source: str, keep=None) -> list[dict]:
+    """CSV 源：`ip,port,CC,ISP`。keep 收的是 ISP 列，不是备注。"""
+    out = []
+    skipped = 0
+    for raw in text.splitlines():
+        m = CSV_RE.match(raw.strip())
+        if not m:
+            continue
+        ip, port, cc, isp = m.group(1), m.group(2), m.group(3).upper(), m.group(4).strip()
+        if keep is not None and not keep(isp):
+            skipped += 1
+            continue
+        out.append({
+            "endpoint": f"{ip}:{port}",
+            "ip": ip,
+            "port": int(port),
+            "remark": f"{cc}-{isp}",
+            "source": source,
+            "res_hint": True,      # 已按 ISP 名过筛
+            "mob_hint": False,
+            "uptime": -1,
+        })
+    if keep is not None:
+        log("源", f"{source:12} 按 ISP 名筛家宽，丢弃 {skipped} 条")
+    return out
+
+
+def read_one(url: str, source: str, keep=None, fmt: str = "list") -> list[dict]:
     for attempt in (1, 2):
         try:
             if not url.startswith("http"):
@@ -187,7 +253,8 @@ def read_one(url: str, source: str, keep=None) -> list[dict]:
                 resp = requests.get(url, timeout=60, headers={"user-agent": "gate-aggregator"})
                 resp.raise_for_status()
                 text = resp.text
-            rows = parse_list(text, source, keep)
+            mirror(text, source, url)
+            rows = parse_csv_list(text, source, keep) if fmt == "csv" else parse_list(text, source, keep)
             if rows:
                 res = sum(1 for r in rows if r["res_hint"])
                 mob = sum(1 for r in rows if r["mob_hint"])
@@ -202,11 +269,14 @@ def read_one(url: str, source: str, keep=None) -> list[dict]:
 
 
 def fetch_sources() -> list[dict]:
-    targets = ([(f"local-{i + 1}", p.strip(), None) for i, p in enumerate(SRC_OVERRIDE.split(",")) if p.strip()]
-               if SRC_OVERRIDE else SOURCES)
+    if SRC_OVERRIDE:
+        targets = [{"name": f"local-{i + 1}", "url": p.strip(), "fmt": "list"}
+                   for i, p in enumerate(SRC_OVERRIDE.split(",")) if p.strip()]
+    else:
+        targets = SOURCES
     rows: list[dict] = []
-    for name, url, keep in targets:
-        rows.extend(read_one(url, name, keep))
+    for cfg in targets:
+        rows.extend(read_one(cfg["url"], cfg["name"], cfg.get("keep"), cfg.get("fmt", "list")))
 
     # 全部上游都失败时，退回本站上一版
     if not rows:
@@ -428,6 +498,14 @@ def main() -> None:
         log("结果", "上游与本站兜底都拿不到数据，本次跳过（保留上一版页面不动）")
         return
 
+    # 源镜像清单：本地工具靠它知道 /src/ 下有哪些原文可取
+    if MIRROR_DIR and _MIRRORED:
+        write(Path(MIRROR_DIR) / "index.json", json.dumps({
+            "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "note": "原始源的镜像，供本地工具直接取（raw.githubusercontent 在国内被阻断）",
+            "files": _MIRRORED,
+        }, ensure_ascii=False, indent=2))
+
     geo = enrich_geo(rows)
     alive = verify(rows)
 
@@ -464,10 +542,10 @@ def main() -> None:
         log("结果", "过滤后没有可用节点，本次跳过")
         return
 
-    # 家宽优先 → 地区按节点数降序 → 同国内 443 优先 → IP 稳定排序
+    # 家宽优先 → 地区按节点数降序 → 同国内 443/8443 优先 → IP 稳定排序
     by_cc = collections.Counter(n["cc"] for n in nodes)
     nodes.sort(key=lambda n: (n["kind"] != "家宽", -by_cc[n["cc"]], n["cc"],
-                              n["port"] != 443, n["ip"]))
+                              n["port"] not in PREFERRED_PORTS, n["ip"]))
 
     res = [n for n in nodes if n["kind"] == "家宽"]
     # 上游 -MOB 标签同样不可靠（会把荷兰的 VPS 也标成移动），必须和「已确认家宽」取交集
