@@ -8,17 +8,19 @@
   · raw.githubusercontent.com 在国内是 SNI 阻断的，本地根本拿不到那些源。
     所以：判定交给海外流水线正确，**可达性交给本机**，而源和结果都走你自己的域名。
 
-两种模式：
-  A. 默认（快，约 30 秒）—— 取站上已判定好的结果，只做本机实测
-       python 本地拉家宽.py
-       python 本地拉家宽.py --res-only      # 只测已判为家宽的那 196+ 条
+两种取数方式（默认全开，三条通道合并去重）：
+  ① 直连原始源   —— 776771 在国内能直连；GitHub 的 raw 有时能连有时被断
+  ② 域名镜像源   —— 直连失败时走 https://<你的域名>/src/ ，海外流水线每轮存下来的原文
+  ③ 站上结果     —— https://<你的域名>/proxyip/all.txt ，已经判定过家宽/机房的成品
 
-  B. --from-src（全流程，几分钟）—— 从 /src/ 取原始源，本地自己筛，再做本机实测
-       python 本地拉家宽.py --from-src
-       源镜像在 https://<你的域名>/src/ ，是海外流水线每轮顺手存下来的原文。
+  python 本地拉家宽.py                    # 三条通道全用，最全
+  python 本地拉家宽.py --result-only      # 只用站上结果，最快（约 30 秒）
+  python 本地拉家宽.py --res-only         # 输出只留家宽
+  python 本地拉家宽.py --no-direct        # 不试直连，直接走域名（网络差时更快）
+  python 本地拉家宽.py --src marina-aqua,inconigto   # 只跑指定源
 
 结果推回链接（可选）：
-  set GH_TOKEN=xxx   然后  python 本地拉家宽.py --from-src --push
+  set GH_TOKEN=xxx   然后  python 本地拉家宽.py --push
   推完约 1 分钟，手机/别的设备就能用 https://<你的域名>/local/all.txt
 """
 from __future__ import annotations
@@ -171,8 +173,19 @@ def parse_csv_text(text: str, src: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# 取源 / 取结果
+# 取源：直连原始源优先，连不上就走域名镜像；站上已判定的结果也一并并进来
 # ---------------------------------------------------------------------------
+RAW = "https://raw.githubusercontent.com"
+SRC_PLAN = [
+    # (名字, 原始直连地址, 解析方式, 过滤)
+    ("gfw-radar", "https://776771.xyz/all.txt", "list", None),
+    ("xiaobei-res", f"{RAW}/Xiaobei09/proxyip/main/data/valid/all_premium.txt", "list", None),
+    ("xiaobei-full", f"{RAW}/Xiaobei09/proxyip/main/data/valid/all.txt", "list", keep_xiaobei_res),
+    ("marina-aqua", f"{RAW}/MarinaAqua/ProxyIP/refs/heads/main/ProxyList.txt", "csv", "isp"),
+    ("inconigto", f"{RAW}/InconigtoVPN/ProxyIP/refs/heads/main/proxyList.txt", "csv", "isp"),
+]
+
+
 def load_region_map() -> dict[str, str]:
     try:
         meta = json.loads(fetch_text(f"{BASE}/proxyip/index.json"))
@@ -181,60 +194,76 @@ def load_region_map() -> dict[str, str]:
         return {}
 
 
-def gather_result(urls: list[str]) -> list[dict]:
-    """模式 A：取站上已经判定好的结果。"""
-    rows: dict[str, dict] = {}
-    for url in urls:
+def fetch_dual(name: str, direct: str, use_direct: bool, use_mirror: bool) -> tuple[str, str] | None:
+    """先直连原始源，失败再走域名镜像。返回 (正文, 实际来源标签)。"""
+    if use_direct:
         try:
-            text = fetch_text(url)
+            return http_get(direct, timeout=25), "直连"
         except Exception as exc:  # noqa: BLE001
-            log(f"  [跳过] {url.rsplit('/', 1)[-1]} -> {exc}")
-            continue
-        got = parse_list_text(text, url.rsplit("/", 1)[-1])
-        new = sum(1 for r in got if r["endpoint"] not in rows)
-        for r in got:
-            rows.setdefault(r["endpoint"], r)
-        log(f"  [结果] {url.rsplit('/', 1)[-1]:22s} {len(got):5d} 行，新增 {new:5d}")
-    return list(rows.values())
+            short = type(exc).__name__
+            if isinstance(exc, urllib.error.HTTPError):
+                short = f"HTTP {exc.code}"
+            log(f"      直连失败（{short}），改走域名镜像")
+    if use_mirror:
+        for url in (f"{BASE}/src/{name}.txt", f"{BASE}/src/{name}.txt?t={int(time.time())}"):
+            try:
+                return http_get(url, timeout=40), "域名镜像"
+            except Exception:  # noqa: BLE001
+                continue
+    return None
 
 
-def gather_src(names: list[str] | None = None) -> list[dict]:
-    """模式 B：从站点 /src/ 取原始源，本地筛。"""
-    plan = [
-        # (站上文件名, 解析方式, 过滤器说明)
-        ("gfw-radar", "list", None),
-        ("xiaobei-res", "list", None),
-        ("xiaobei-full", "list", keep_xiaobei_res),
-        ("marina-aqua", "csv", "isp"),
-        ("inconigto", "csv", "isp"),
-    ]
-    if names:
-        plan = [p for p in plan if p[0] in names]
+def gather_all(use_direct: bool, use_mirror: bool, use_result: bool,
+               only_src: list[str] | None = None,
+               use_sources: bool = True) -> list[dict]:
+    """把三条通道都拉下来合并去重：站上结果 > 原始源（直连/镜像）。
 
-    total: dict[str, dict] = {}
-    stats = []
-    for fname, fmt, keep in plan:
-        url = f"{BASE}/src/{fname}.txt"
+    kind 的优先级：站上结果里已经判定过，最可信；源里的按本地口径现判。
+    """
+    merged: dict[str, dict] = {}
+
+    def absorb(rows: list[dict], prefer_existing: bool) -> int:
+        new = 0
+        for r in rows:
+            old = merged.get(r["endpoint"])
+            if old is None:
+                merged[r["endpoint"]] = r
+                new += 1
+            elif prefer_existing and old["kind"] == "未知" and r["kind"] != "未知":
+                old["kind"] = r["kind"]
+        return new
+
+    # 通道 1：站上已判定结果（家宽优先）
+    if use_result:
         try:
-            text = fetch_text(url)
+            text = fetch_text(f"{BASE}/proxyip/all.txt", tries=2)
+            rows = parse_list_text(text, "站点结果")
+            n = absorb(rows, prefer_existing=False)
+            log(f"  [结果] 站点已判定清单      {len(rows):6d} 行，新增 {n:6d}")
         except Exception as exc:  # noqa: BLE001
-            log(f"  [跳过] {fname}（{type(exc).__name__}）—— 站点上可能还没镜像这个源")
+            log(f"  [结果] 站点清单取不到（{type(exc).__name__}），跳过")
+
+    # 通道 2：原始源，直连优先、镜像兜底
+    for name, direct, fmt, keep in (SRC_PLAN if use_sources else []):
+        if only_src and name not in only_src:
             continue
-        raw_rows = parse_csv_text(text, fname) if fmt == "csv" else parse_list_text(text, fname)
+        got = fetch_dual(name, direct, use_direct, use_mirror)
+        if not got:
+            log(f"  [源]   {name:14s} 直连和镜像都拿不到，跳过")
+            continue
+        text, via = got
+        raw_rows = parse_csv_text(text, name) if fmt == "csv" else parse_list_text(text, name)
         if keep == "isp":
             kept = [r for r in raw_rows if r["kind"] == "家宽"]
         elif keep is not None:
             kept = [r for r in raw_rows if keep(r["remark"])]
         else:
             kept = raw_rows
-        new = sum(1 for r in kept if r["endpoint"] not in total)
-        for r in kept:
-            total.setdefault(r["endpoint"], r)
-        stats.append((fname, len(raw_rows), len(kept), new))
-        log(f"  [源] {fname:14s} 原文 {len(raw_rows):6d} 行 -> 筛出 {len(kept):5d}，新增 {new:5d}")
-    if stats:
-        log(f"  合计候选 {len(total)}（{len(stats)} 个源）")
-    return list(total.values())
+        n = absorb(kept, prefer_existing=True)
+        log(f"  [源]   {name:14s} 原文 {len(raw_rows):6d} 行 -> 筛出 {len(kept):5d}，新增 {n:5d}  ({via})")
+
+    log(f"  合并去重后候选 {len(merged)}")
+    return list(merged.values())
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +317,8 @@ def write(path: Path, text: str) -> None:
 
 
 def push_github(outdir: Path, repo: str, token: str, prefix: str = "local") -> None:
+    """把结果写进仓库 local/ 目录。工作流会把它并进站点，于是有自己的域名可用。
+    只推顶层几个文件——61 个地区文件每次都提交太吵，需要时本地重新跑一遍就有。"""
     api = f"https://api.github.com/repos/{repo}/contents"
     hdr = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
 
@@ -308,18 +339,20 @@ def push_github(outdir: Path, repo: str, token: str, prefix: str = "local") -> N
         with urllib.request.urlopen(req, timeout=60) as r:
             log(f"  [推送] {remote}  HTTP {r.status}")
 
-    for p in sorted(outdir.rglob("*")):
+    for p in sorted(outdir.iterdir()):
         if p.is_file():
-            put(f"{prefix}/{p.relative_to(outdir).as_posix()}", p.read_bytes())
+            put(f"{prefix}/{p.name}", p.read_bytes())
 
 
 # ---------------------------------------------------------------------------
 def main(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(description="从自己的域名取源/取结果，在本机实测家宽")
-    ap.add_argument("--from-src", action="store_true", help="从 /src/ 取原始源，本地筛（全流程）")
-    ap.add_argument("--src", default="", help="--from-src 时只跑指定源，逗号分隔")
-    ap.add_argument("--res-only", action="store_true", help="模式 A 下只测已判为家宽的")
-    ap.add_argument("--url", default="", help="自定义清单地址（逗号分隔），优先于上面模式")
+    ap = argparse.ArgumentParser(description="从自己的域名+原始源取数据，在本机实测家宽")
+    ap.add_argument("--no-direct", action="store_true", help="不直连原始源，只用域名镜像")
+    ap.add_argument("--no-mirror", action="store_true", help="不用域名镜像，只直连原始源")
+    ap.add_argument("--no-result", action="store_true", help="不并入站上已判定的结果")
+    ap.add_argument("--result-only", action="store_true", help="只用站上已判定的结果（最快）")
+    ap.add_argument("--src", default="", help="只跑指定源，逗号分隔：gfw-radar,xiaobei-res,xiaobei-full,marina-aqua,inconigto")
+    ap.add_argument("--res-only", action="store_true", help="输出只留家宽")
     ap.add_argument("--std-ports", action="store_true", help="只测 443/8443")
     ap.add_argument("--max-rtt", type=int, default=800, help="RTT 上限毫秒，0=不限（默认 800）")
     ap.add_argument("--conc", type=int, default=48, help="并发（默认 48）")
@@ -330,17 +363,14 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--repo", default="xa-rgb/gate", help="推送目标仓库")
     a = ap.parse_args(argv)
 
-    if a.url:
-        log(f"== 第 1 步：拉自定义清单（{BASE}）")
-        rows = gather_result([u.strip() for u in a.url.split(",") if u.strip()])
-    elif a.from_src:
-        log(f"== 第 1 步：从 {BASE}/src/ 取原始源，本地筛")
-        log("   口径：CSV 源按 ISP 名判家宽；xiaobei 源取「-RES/-MOB 且带 -CN 标记」")
-        rows = gather_src([s.strip() for s in a.src.split(",") if s.strip()] or None)
-    else:
-        url = f"{BASE}/proxyip/residential.txt" if a.res_only else f"{BASE}/proxyip/all.txt"
-        log(f"== 第 1 步：拉站上已判定的结果（{BASE}）")
-        rows = gather_result([url])
+    only_src = [s.strip() for s in a.src.split(",") if s.strip()] or None
+    log(f"== 第 1 步：取数据（直连原始源 {'关' if a.no_direct or a.result_only else '开'} / "
+        f"域名镜像 {'关' if a.no_mirror else '开'} / 站上结果 {'关' if a.no_result else '开'}）")
+    rows = gather_all(use_direct=not a.no_direct and not a.result_only,
+                      use_mirror=not a.no_mirror and not a.result_only,
+                      use_result=not a.no_result,
+                      only_src=only_src,
+                      use_sources=not a.result_only)
 
     if not rows:
         log("一条都没拉到：先确认域名能打开，以及站点上是否已有对应文件")
@@ -360,6 +390,10 @@ def main(argv: list[str]) -> int:
     alive = [r for r in rows if r["rtt"] is not None]
     kept = [r for r in alive if (not a.max_rtt or r["rtt"] <= a.max_rtt)]
     slow, dead = len(alive) - len(kept), len(rows) - len(alive)
+    if a.res_only:
+        before = len(kept)
+        kept = [r for r in kept if r["kind"] == "家宽"]
+        log(f"  只留家宽：{before} -> {len(kept)}")
     log(f"\n== 结果：可连 {len(alive)}/{len(rows)}；保留 {len(kept)}（丢慢 {slow}、丢不通 {dead}）")
 
     kept.sort(key=lambda r: (r["kind"] != "家宽", r["rtt"]))
@@ -391,6 +425,12 @@ def main(argv: list[str]) -> int:
     rtts = sorted(r["rtt"] for r in kept)
     if rtts:
         log(f"  RTT：最快 {rtts[0]}ms  中位 {rtts[len(rtts) // 2]}ms  最慢 {rtts[-1]}ms")
+    # 端口分档：高位端口在家用宽带上命中极低（实测 341 条高位只活 1 条），单独列出来
+    buckets = {"443": 0, "8443": 0, "其他<10000": 0, ">=10000": 0}
+    for r in kept:
+        p = r["port"]
+        buckets["443" if p == 443 else "8443" if p == 8443 else ">=10000" if p >= 10000 else "其他<10000"] += 1
+    log("  端口分档：" + "  ".join(f"{k} {v}" for k, v in buckets.items()))
     log(f"\n== 产物：{outdir}")
     log(f"   all.txt {len(kept)} 行 / residential.txt {len(res)} 行 / by-region {len(by_region)} 个地区")
 
